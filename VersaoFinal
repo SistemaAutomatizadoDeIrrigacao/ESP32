@@ -1,0 +1,291 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <DHT.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+
+#define FIREBASE_HOST "esp32irrigacao-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "vz7C67vfvWdVsgTGso31kQ28u2vyJSyz48FwqDSu"
+
+// Definições de Tarefas
+TaskHandle_t sensorTaskHandle;
+TaskHandle_t communicationTaskHandle;
+
+#define DHT_PIN 5
+#define DHT_TYPE DHT22
+#define LED_PIN 2
+#define PUMP_PIN 4
+#define SOIL_MOIST_PIN 34
+
+
+const char* ssid = /*"Multilaser_2.4G_00B5F0";*/"motorolaEsp32";//"WIFI-IOT";
+const char* password = /*"die31846789";*/"31846789";//"QzFjGFJD";
+
+float soilMoistThresholdOn = 30.0;
+float soilMoistThresholdOff = 50.0;
+float soilMoisture = 0.0;
+float airTemperature = 0.0;
+float airHumidity = 0.0;
+int soilMoistureValue = 0;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+FirebaseConfig config;
+FirebaseAuth auth;
+FirebaseData firebaseData;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+LiquidCrystal_I2C lcd(0x27,16,2);
+
+
+unsigned long previousMillis = 0;
+unsigned long previousMillisSave = 0;
+const long interval = 2000; // 2 segundos
+const long saveInterval = 300000; // 5 minutos
+
+#define WIFI_MAX_RETRIES 20
+#define WIFI_RETRY_DELAY 5000 // 5 segundos
+
+
+void setup() {
+  Wire.begin(21, 22);
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(SOIL_MOIST_PIN, INPUT);
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+
+  connectToWiFi();
+  connectToFirebase();
+ 
+  
+ 
+
+  // Criar as tarefas em cores separadas
+  xTaskCreatePinnedToCore(sensorTask, "Sensor Task", 10000, NULL, 1, &sensorTaskHandle, 0);
+  xTaskCreatePinnedToCore(communicationTask, "Communication Task", 10000, NULL, 1, &communicationTaskHandle, 1);
+}
+
+void loop() {
+  
+
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando-se a ");
+  Serial.print(ssid);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < WIFI_MAX_RETRIES) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+  } else {
+    Serial.println("\nFalha ao conectar ao Wi-Fi após várias tentativas.");
+    delay(WIFI_RETRY_DELAY); // Pausa antes de tentar reconectar novamente
+  }
+}
+
+void connectToFirebase() {
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void checkWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi desconectado. Tentando reconectar...");
+    connectToWiFi();
+  }
+}
+
+void checkFirebaseConnection() {
+  if (!Firebase.ready()) {
+    Serial.println("Firebase Tentando reconectar...");
+    connectToFirebase();
+  }
+}
+
+void updateTimestamp() {
+  timeClient.update();
+  unsigned long epochTime = timeClient.getEpochTime();
+  if (Firebase.setInt(firebaseData, "/status/lastTimestamp", epochTime)) {
+    Serial.println("Timestamp atualizado com sucesso.");
+  } else {
+    Serial.println("Falha ao atualizar timestamp: " + firebaseData.errorReason());
+  }
+}
+
+void salvarDadosSensors() {
+  timeClient.update();
+  unsigned long epochTime = timeClient.getEpochTime();
+  String datetime = String(epochTime); // Formato do timestamp
+
+  // Formatar os dados
+  String airTempData = String(airTemperature) + "," + datetime;
+  String airHumidityData = String(airHumidity) + "," + datetime;
+  String soilMoistureData = String(soilMoisture) + "," + datetime;
+
+  // Salvar os dados
+  Firebase.pushString(firebaseData, "/sensordatabase/airTemperature", airTempData);
+  Firebase.pushString(firebaseData, "/sensordatabase/airHumidity", airHumidityData);
+  Firebase.pushString(firebaseData, "/sensordatabase/soilMoisture", soilMoistureData);
+}
+
+void controlPump() {
+
+  if (Firebase.getBool(firebaseData, "/control/pumpStatus")) {
+    bool pumpStatus = firebaseData.boolData();
+    digitalWrite(PUMP_PIN, pumpStatus ? HIGH : LOW);
+    Serial.println(pumpStatus ? "BOMBA ligado." : "BOMBA desligado.");
+  }
+
+  if (Firebase.getFloat(firebaseData, "/control/soilMoistThresholdOn")) {
+    soilMoistThresholdOn = firebaseData.floatData();
+  }
+  if (Firebase.getFloat(firebaseData, "/control/soilMoistThresholdOff")) {
+    soilMoistThresholdOff = firebaseData.floatData();
+  }
+
+  if (soilMoisture < soilMoistThresholdOn) {
+    digitalWrite(PUMP_PIN, HIGH);
+    Firebase.setBool(firebaseData, "/control/pumpStatus", true);
+  } else if (soilMoisture > soilMoistThresholdOff) {
+    digitalWrite(PUMP_PIN, LOW);
+    Firebase.setBool(firebaseData, "/control/pumpStatus", false);
+  }
+
+}
+
+void updateLCD() {
+  // Limpa o display
+  lcd.clear();
+  
+  // Primeira linha: Umidade do solo, Temperatura do ar e Umidade do ar
+  lcd.setCursor(0, 0);
+  lcd.print("S:");
+  lcd.print(soilMoisture, 1); // Exibe a umidade do solo com 1 decimal
+  lcd.print("%  T:");
+  lcd.print(airTemperature, 1); // Exibe a temperatura do ar com 1 decimal
+  lcd.print("C");
+
+  // Segunda linha: Limiar de ligar e desligar
+  lcd.setCursor(0, 1);
+  lcd.print("L:");
+  lcd.print(soilMoistThresholdOn, 1); // Exibe o limiar de ligar a bomba
+  lcd.print("  D:");
+  lcd.print(soilMoistThresholdOff, 1); // Exibe o limiar de desligar a bomba
+}
+
+
+void controlLED() {
+
+  if (Firebase.getBool(firebaseData, "/control/ledStatus")) {
+    bool ledStatus = firebaseData.boolData();
+    digitalWrite(LED_PIN, ledStatus ? HIGH : LOW);
+    Serial.println(ledStatus ? "LED ligado." : "LED desligado.");
+  }
+}
+
+void readAndUpdateSensors() {
+
+  if (!isnan(airTemperature)) {
+    Firebase.setFloat(firebaseData, "/sensors/airTemperature", airTemperature);
+  }
+  if (!isnan(airHumidity)) {
+    Firebase.setFloat(firebaseData, "/sensors/airHumidity", airHumidity);
+  }
+  Firebase.setFloat(firebaseData, "/sensors/soilMoisture", soilMoisture);
+}
+
+// Tarefa de leitura dos sensores 
+void sensorTask(void *pvParameters) {
+  unsigned long previousMillis = 0; // Armazena o tempo da última leitura
+  const long interval = 2000; // Intervalo
+
+  for (;;) {
+    unsigned long currentMillis = millis(); // Captura o tempo atual
+
+    // Executa a leitura dos sensores a cada 'interval' milissegundos
+    if (currentMillis - previousMillis >= interval) {
+      previousMillis = currentMillis; // Atualiza o tempo da última leitura
+
+      airTemperature = dht.readTemperature();
+      airHumidity = dht.readHumidity();
+      soilMoistureValue = analogRead(SOIL_MOIST_PIN);
+      soilMoisture = map(soilMoistureValue, 1000, 4095, 100, 0);
+      soilMoisture = constrain(soilMoisture, 0, 100);
+
+      // Imprimindo as leituras dos sensores no Serial Monitor
+      Serial.print("Temperatura do ar: ");
+      Serial.print(airTemperature);
+      Serial.println(" °C");
+
+      Serial.print("Umidade do ar: ");
+      Serial.print(airHumidity);
+      Serial.println(" %");
+
+      Serial.print("Umidade do solo: ");
+      Serial.print(soilMoisture);
+      Serial.println(" %");
+
+      Serial.print("Valor bruto do sensor de umidade do solo: ");
+      Serial.println(soilMoistureValue);
+
+      // Verificação da umidade do solo e controle automático da bomba
+      if (soilMoisture < soilMoistThresholdOn) {
+        digitalWrite(PUMP_PIN, HIGH);  // Liga a bomba
+      } else if (soilMoisture > soilMoistThresholdOff) {
+        digitalWrite(PUMP_PIN, LOW);   // Desliga a bomba
+      }
+     updateLCD(); 
+    }
+    
+    vTaskDelay(200 / portTICK_PERIOD_MS); // Um pequeno delay para liberar CPU
+  }
+}
+
+
+// Tarefa de comunicação com o Firebase ou outros servidores
+void communicationTask(void *pvParameters) {
+  for (;;) {
+          unsigned long currentMillis = millis();
+
+        // Executa a cada 2 segundos
+        if (currentMillis - previousMillis >= interval) {
+          previousMillis = currentMillis;
+          checkWiFi();
+          checkFirebaseConnection();
+
+          if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+                updateTimestamp();
+                readAndUpdateSensors();
+                controlPump();
+                controlLED();
+               } 
+        }
+
+        
+        if (currentMillis - previousMillisSave >= saveInterval) {
+          previousMillisSave = currentMillis;
+          salvarDadosSensors(); // Chama a função para salvar dados dos sensores
+        }
+  }
+}
+
+
+
